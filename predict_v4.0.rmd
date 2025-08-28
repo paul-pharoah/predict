@@ -1,0 +1,500 @@
+---
+title: "PREDICT v4.0"
+output:
+  html_document:
+    css: styles_1.css
+date: "2025-08-14"
+---
+
+```{r setup, echo=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warnings=FALSE)
+library(tidyverse)
+library(forcats)
+library(survival)
+library(mfp)
+library(tableone)
+library(survMisc)
+library(rms)
+library(broom)
+library(kableExtra)
+library(patchwork)
+library(pROC)
+```
+
+## Introduction
+
+PREDICT breast v3.1 was developed using data from 4,644 ER-negative and 30,830 ER-positive breast cancer cases diagnosed from 2000 to 2017 in the region served by the Eastern Cancer Registry in the UK. The model was optimised for up to 15 years of follow-up. As in version 2, version 3 of the model has separate models for ER-positive and ER-negative disease.  
+
+We then used data from 32,408 breast cancer patients from the West Midlands Cancer Registry and from 100,551 breast cancer cases from the other English Cancer Registries combined to test the model. This showed that predicted numbers of 5-, 10- and 15-year breast cancer deaths were within 10 per cent of the observed number in the test data set. 
+
+However, for clinical decision making most clinicians use the 10-year outcomes.  The purpose of this analysis was to reparameterise the model to optimise performance in most recently diagnosed cases with up to 10 years of follow-up, i.e. those diagnosed from 2011 (maximum follow-up 10 years) to 2017 (maximum follow-up 4 years).  
+
+
+```{r data, include=FALSE}
+phe <- read_csv("./Breast/Outputs/phe_clean.csv") |> 
+  mutate(screen = case_when(age<50 | age>69 ~ 0, 
+                            is.na(screen) ~ 0.2, 
+                            TRUE ~ screen),
+         year.gp = if_else(year<2011, 1, 0),
+         age.offset = age - 24, 
+         er.fac = factor(er, labels=c("ER neg", "ER pos"))) |>
+  select(1, 2, 3, 38, 39, 40, 5:17, 25:27, 29:31, 34, 35) |> filter(fu_10>0)
+
+train <- phe |>
+  filter(train==1) 
+er0 <- train |> filter(er==0)
+er1 <- train |> filter(er==1)
+
+```
+  
+  
+A total of `r nrow(df)` cases were available for inclusion in the analysis.  These were randomly split 50:50 into a model training data set and a model testing data set.  The training data comprise `r nrow(er0)` ER negative cases and `r nrow(er1)` ER positive cases. 
+
+
+*Table 1: Characteristics of eligible cases by ER status*
+
+```{r table1, include=FALSE}
+df <- phe |>
+  mutate(train = factor(train, labels=c("Test data", "Train data")),
+         age.gp = cut(age.offset, breaks=c(1, 16, 36, 46, Inf), labels=c("<40", "40-59", "60-69", ">=70"), right=FALSE),
+         size.gp = cut(size, breaks=c(0, 20, 50, Inf), labels=c("1-19", "20-40", "50+"), right=FALSE),
+         node.gp = cut(nodes, breaks=c(0, 1, 4, 10, Inf), labels=c("Node neg", "1-3", "4-9", "10+"), right=FALSE),
+         mode = factor(screen, labels=c("Clinical", "Unknown", "Screening")))
+
+myVars <- c("age.gp", "grade", "size.gp", "node.gp", "mode")
+
+## Vector of categorical variables that need transformation
+catVars <- c("age.gp", "grade", "size.gp", "node.gp")
+
+## Create a TableOne object
+tab1 <- CreateTableOne(vars = myVars, data = df, factorVars = catVars, 
+                       strata = c("train", "er.fac"), test=FALSE,
+                       includeNA = TRUE)
+table1 <- print(tab1)
+```
+
+```{r, include=TRUE}
+tabnames <- c("Number", "Age diagnosis (%)", "   <40", "   40-59", "  60-69", " >=70" ,
+              "Grade (%)", "   1" , "   2", "   3",
+              "Tumour size (%)", "   1-19 mm", "   20-49 mm", "   50+ mm", "Node status", "   Node neg.", "   1-3 pos", "   4-9 pos", "   10+ pos", "Mode of detection (%)", "   Clinical detected", "   Unknown","   Screen detected")
+
+row.names(table1) <- tabnames
+kable(table1, format.args = list(big.mark = ",")) |>
+   kable_styling(latex_options = "striped", font_size=10, full_width=FALSE, position="left") 
+rm(tab1, table1, catVars, myVars)
+```
+
+
+## Model building
+
+Multivariable Cox proportional hazards models were used to estimate the prognostic effect of each variable.  In all models follow up time was defined as the time from breast cancer diagnosis to last follow up, death or 15 years after diagnosis, whichever came first.  The outcome of interest was either breast cancer-specific mortality or mortality from other causes.
+  
+Separate models were derived for breast cancer-specific mortality in ER-negative and ER-positive cases. Multiple fractional polynomials were used to model non-linear effects between the continuous risk factors (age at diagnosis, tumour size and number of positive nodes) and breast cancer-specific mortality as adding higher order polynomials to the model will improve the fit to the data in the presence of non-linearity. Sequential backward elimination with a maximum of 4 degrees of freedom for a single continuous predictor was used to estimate the continuous variable transformations.  Age at diagnosis was transformed to age at diagnosis minus 24 so that the baseline hazard corresponds to that of a case diagnosed age 24.
+  
+The relative treatment benefits for chemotherapy, hormone therapy and radiotherapy were constrained to the estimates of benefit from the randomised controlled trial meta-analyses of the Early Breast Cancer Trialists Collaborative Group (adjuvant hormone therapy log hazard ratio -0.386 20, adjuvant chemotherapy log hazard ratio -0.248 21, radiotherapy log hazard ratio -0.180 22) by adding them as an offset in the analyses.
+  
+After fitting the Cox proportional hazards models to ER-negative and ER-positive cases, a multiple fractional polynomial model with a Gaussian distribution was fit to the baseline hazards according to the method of Sauberei and colleagues to derive smoothed baseline hazard functions for breast cancer-specific mortality.
+  
+A single multivariate Cox regression model for mortality from other causes (non-breast cancer-specific) was built for ER-negative and ER-positive cases combined with year of diagnosis and age at diagnosis modeled using multivariable fractional polynomials. Year of diagnosis was grouped into before 2011 and 2011 and later; the latter was used as the baseline category so that the. baseline hazard function will be that for more contemporary patients.  The relative harms of chemotherapy and radiotherapy were constrained to the estimates of benefit reported by Kerr and colleagues (adjuvant chemotherapy log hazard ratio 0.183) and Taylor and colleagues (radiotherapy log hazard ratio 0.078 per Gray whole-heart dose) by adding them as an offset in the analyses. The smoothed baseline hazard function for non-breast cancer specific mortality was also computed using a multivariable fractional polynomial model. 
+
+
+
+### ER-negative model 
+
+There were `r nrow(er0)` cases in the training set for the ER-negative model.  A multi-variable fractional polynomial Cox proportional hazards model was fit. The multi-variable polynomial functions for age at diagnosis, tumour size and number of positive nodes were given by
+  
+  
+```{r mfper0, include=FALSE}
+surv.er0 <- with(er0, (Surv(time=fu_15, event=br_15)))
+
+er0.mfp <-  mfp(surv.er0 ~  fp(age.offset) + fp(size) + fp(nodes) +
+                     grade + as.factor(screen) + year.gp + offset(hcr),
+                   alpha = 0.01,
+                   select = 0.1, # significance level of degrees of freedom test
+                   data = er0, family = cox, rescale = F, method = "efron",
+                   verbose = FALSE) # shows the power(s) and all steps
+summary(er0.mfp)
+
+# Derive variables based on MFP functions
+er0 <- er0 |> 
+  rename(screen0 = screen,
+         grade0 = grade,
+         year.gp0 = year.gp) |>
+  mutate( age0.1 = (age.offset/100)^3,
+          age0.2 = 0,
+          size0.1 = log(size/10),
+          size0.2 = 0,
+          nodes0.1 = log(nodes + 1),
+          nodes0.2 = 0)
+```
+
+$$Age.1 = ((age-24)/100)^3$$
+
+$$Size = log(size/10))$$
+
+$$Nodes = log(nodes + 1)$$
+A multi-variable Cox proporptiaonal hazards model was then refit with the prognostic variables transformed according to the multi-variable fractional polynomial functions given above with the effects of therapy offset in the model.
+
+```{r er0model}
+# Fit Cox PH model 
+er0.cox <- coxph(surv.er0 ~ age0.1 + age0.2 +
+                      size0.1 + size0.2 + nodes0.1 + nodes0.2 + grade0 + 
+                      as.factor(screen0) + year.gp0 + offset(hcr), #- treatments as offset
+                    data = er0)
+er0.coefs <- tidy(er0.cox)
+er0.coefs$term[9] <- "screen0"
+```
+
+### ER-positive model
+
+There were `r nrow(er1)` cases in the training set for the ER-positive model.  A multi-variable fractional polynomial Cox proportional hazards model was fit. The multi-variable polynomial functions for age at diagnosis, tumour size and number of positive nodes were given by
+
+```{r mfper1, include=FALSE}
+er1 <- train |> filter(er==1)  
+surv.er1 <- with(er1, (Surv(time=fu_15, event=br_15)))
+
+er1.mfp <-  mfp(surv.er1 ~ fp(age.offset) + fp(nodes, df=4) +
+                     fp(size) + grade + as.factor(screen) + year.gp + offset(hcr),
+                   alpha = 0.01,
+                   select = 1, # significance level of degrees of freedom test
+                   data = er1, family =  cox, rescale = F, method = "efron",
+                   verbose= FALSE) # shows the power(s) and all steps
+
+summary(er1.mfp)
+er1 <- er1 |>
+  rename(screen1 = screen, grade1 = grade, year.gp1=year.gp) |>
+  mutate(age1.1 = (age.offset/100)^.5,
+         age1.2 = (age.offset/100), 
+         nodes1.1 =  log(nodes + 1) ,
+         nodes1.2 = 0,
+         size1.1 = (size/10)^.5,
+         size1.2 = (size/10))
+rm(er1.mfp)
+```
+$$Age.1 = ((age-24)/100)^{0.5}$$
+$$Age.2 = (age-24)/100$$
+$$ Nodes = log(nodes+1)$$
+
+
+$$Size.1 = (size/10)^{0.5} $$
+$$ Size.2 = (size/10)$$
+
+A multi-variable Cox proporptional hazards model was then refit with the prognostic variables transformed according to the multi-variable fractional polynomial functions given above with the effects of therapy offset in the model.
+
+```{r er1model}
+# Fit Cox PH model 
+er1.cox <- coxph(surv.er1 ~ age1.1 + age1.2 + 
+                      size1.1 + size1.2 + nodes1.1 + nodes1.2 + grade1  + 
+                      as.factor(screen1) + year.gp1 + offset(hcr),
+                    data = er1)
+er1.coefs <- tidy(er1.cox)
+er1.coefs$term[9] <- "screen1"
+
+
+```
+
+### Other mortality
+```{r mfpot, include=FALSE}
+surv.ot <- with(train, (Surv(time=fu_15, event=ot_15)))
+# Fit fractional polynomial model for age
+oth.mfp <- mfp(surv.ot ~ fp(age.offset) + year.gp + offset(cr_ot),
+                 alpha = 0.05, select = 1,
+                 family = cox, rescale = F, verbose=FALSE, data=train)
+summary(oth.mfp)
+
+# Fit fractional polynomial model for age
+train <- train |> rename(year.gp.oth = year.gp) |>
+  mutate(age.oth.1 = (age.offset/100)^-0.5, 
+         age.oth.2 = (age.offset/100)^2)
+
+# Fit proportional hazard model
+oth.cox <- coxph(surv.ot ~ age.oth.1 + age.oth.2 + year.gp.oth + offset(cr_ot), data=train) 
+
+oth.coefs <- tidy(oth.cox)
+
+coefs <- bind_rows(er0.coefs, er1.coefs, oth.coefs)
+
+rm(oth.mfp, er0.coefs, er1.coefs, oth.coefs)
+
+```
+Non-breast cancer mortality was modelled with the combined ER negative and ER positive cases using a Cox porportional hazards model.  Age at diagnosis was fit using a multi-variable polynomial, with the function for age at diagnosis being given by
+
+$$age.1 = ((age-24)/100)^{-0.5}$$
+$$age.2 = ((age - 24)/100)^2$$
+
+### Baseline hazard function estimation
+
+A multiple fractional polynomial model with a Gaussian distribution was fit to the baseline hazards according to the method of Sauberei and colleagues to derive smoothed baseline hazard functions for breast cancer-specific mortality.
+
+```{r basehaz, include=FALSE}
+# Calculate hazard function and if TRUE mean values of covariates are used and if FALSE covariates are equal to zero
+h0.br <- basehaz(er0.cox, centered = FALSE) |>
+  # Remove hazard zero
+  filter(hazard!=0) |>
+  # Log transform
+  mutate(group = "ER negative",
+         z0 = log(hazard))
+
+h1.br <- basehaz(er1.cox, centered = FALSE) |>
+  # Remove hazard zero
+  filter(hazard!=0) |>
+  # Log transform
+  mutate(group = "ER positive",
+         z0 = log(hazard))
+
+h.oth <- basehaz(oth.cox, centered=FALSE) |>
+  filter(hazard!=0) |>
+  mutate(z0 = log(hazard),
+         group = "Other")
+
+# Fit Multiple Polynomial Model with gaussian distribution - Baseline hazard function
+bh0 <- mfp(z0 ~ fp(time, df = 4, select = 0.1), data = h0.br, family = gaussian, rescale = FALSE)
+temp <- summary(bh0)$coefficients
+
+coefs <- coefs |> 
+   bind_rows(tibble(term = c("bh0.i", "bh0.1", "bh0.2"),
+                   estimate=c(temp[1,1], temp[2,1], temp[3,1]),
+                   std.error=c(temp[1,2], temp[2,2], temp[3,2])))
+ 
+bh1 <- mfp(z0 ~ fp(time, df = 4, select = 0.05), data = h1.br, family = gaussian, rescale = FALSE)
+temp <- summary(bh1)$coefficients
+
+coefs <- coefs |> 
+  bind_rows(tibble(term = c("bh1.i", "bh1.1", "bh1.2"),
+                   estimate=c(temp[1,1], temp[2,1], temp[3,1]),
+                   std.error=c(temp[1,2], temp[2,2], temp[3,2]))) 
+
+bh.oth <- mfp(z0 ~ fp(time, df = 4, select = 0.05), data = h.oth, family = gaussian, rescale = FALSE, verbose=TRUE)
+temp <- summary(bh.oth)$coefficients
+
+coefs <- coefs |> 
+  bind_rows(tibble(term = c("bh.oth.i", "bh.oth.1", "bh.oth.2"),
+                   estimate=c(temp[1,1], temp[2,1], temp[3,1]),
+                   std.error=c(temp[1,2], temp[2,2], temp[3,2]))) |>
+  select(1:3) |>
+   mutate(variable = paste0(term, " <- ", estimate))
+
+write_csv(coefs, "./Breast/Version4.0/Outputs/coefs_v4.0.csv")
+rm(temp)
+```
+
+```{r, hr.functions}
+coefs <- read_csv("./Breast/Version4.0/Outputs/coefs_v4.0.csv")
+a <- as.numeric(coefs$estimate[coefs$term=="age0.1"])
+b <- as.numeric(coefs$estimate[coefs$term=="age0.2"])
+c <- as.numeric(coefs$estimate[coefs$term=="age1.1"])
+d <- as.numeric(coefs$estimate[coefs$term=="age1.2"])
+
+age.func <- function(age=50, er=0) {
+  if (er==0) { hr = a*((age-24)/100)^3 - (a*((50-24)/100)^3) }
+  else { hr = c*((age-24)/100)^.5 + d*(age-24)/100 - (c*((50-24)/100)^.5 + d*(50-24)/100)}
+  return(exp(hr))
+}
+
+e <- as.numeric(coefs$estimate[coefs$term=="size0.1"])
+f <- as.numeric(coefs$estimate[coefs$term=="size0.2"])
+g <- as.numeric(coefs$estimate[coefs$term=="size1.1"])
+h <- as.numeric(coefs$estimate[coefs$term=="size1.2"])
+
+size.func <- function(size=20, er=0) {
+  size.er1 = pmin(size, 78)
+  size.er0 = pmax(size, 3)
+  if (er == 0) { size.pi =  e*log(size/10) - (e*log(2)) } 
+  else { size.pi = g*(size.er1/10)^.5+ h*(size.er1/10) -  (g*(2)^.5 + h*(2)) }
+  return(exp(size.pi))
+}
+
+i <- as.numeric(coefs$estimate[coefs$term=="nodes0.1"])
+j <- as.numeric(coefs$estimate[coefs$term=="nodes0.2"])
+k <- as.numeric(coefs$estimate[coefs$term=="nodes1.1"])
+l <- as.numeric(coefs$estimate[coefs$term=="nodes1.2"])
+
+nodes.func <- function(nodes, er) {
+  if (er == 0) { nodes.pi = i*log(nodes + 1) - (i*log(1))}
+  else { nodes.pi = k*log(nodes+1) }
+  return(exp(nodes.pi))
+}
+```
+
+### Multi-variable polynomial functions
+
+The hazard ratio as a function of the fractional polynomials for age at diagnosis tumour size and number of positive nodes are shown in Figure 1.  The observed baseline hazards and the fitted curve for the corresponding multi-variable fractional polynomial regression are shown in Figure 2.
+
+*Figure 1: Multi-variable fractional polynomial hazard ratio functions by ER status for A age at diaggnosis, B. tumour size and C number of positive nodes*
+
+```{r fig1, fig.width=8, fig.height=3}
+A <- ggplot(data=tibble(age = 25:85), aes(x = age)) +
+  stat_function(fun = age.func, args=list(er=0), color = 'red') +
+  stat_function(fun = age.func, args=list(er=1), color = 'blue') +
+  scale_x_continuous(name = "Age at diagnosis", breaks = seq(25, 85, 10)) +
+  scale_y_log10() + #breaks=c(1, 2, 3) , name = "Hazard ratio", limits=c(0.9, 3)) +
+  theme_bw() +
+  theme(axis.title=element_text(size=12),
+        axis.text=element_text(size=10))
+
+B <- ggplot(data = tibble(size = 2:200), aes(x=size)) +
+  stat_function(fun = size.func, args = list(er=1), color = 'blue') +
+  stat_function(fun = size.func, args = list(er=0), color = 'red') +
+  scale_y_log10(breaks=c(0.5, 1, 2, 4, 8, 16)) +
+  theme_bw() +
+  labs(x = "Tumour size (mm)",
+       y = "Hazard ratio v 20 mm")
+
+C <- ggplot(data = tibble(nodes = 0:20), aes(x=nodes)) +
+  stat_function(fun = nodes.func, args = list(er=1), color = 'blue') +
+  stat_function(fun = nodes.func, args = list(er=0), color='red') +
+  scale_y_log10(breaks=c(0.5, 1, 2, 4, 8), limits=c(0.3, 12)) +
+  theme_bw()  +
+  theme(axis.title=element_text(size=12),
+        axis.text=element_text(size=10)) +
+  labs(x = "No. positive nodes",
+       y = "Hazard ratio")
+
+fig.1 <- A + B + C + plot_annotation(tag_levels='A')
+rm(A, B, C)
+fig.1
+```
+
+
+
+*Figure 2: Observed baseline hazard (grey) points and multi-variable fractional polynomial baseline hazard functions (blue line)*
+
+```{r fig, fig.width=6, fig.height=3}
+a <- as.numeric(coefs$estimate[coefs$term=="bh0.i"])
+b <- as.numeric(coefs$estimate[coefs$term=="bh0.1"])
+c <- as.numeric(coefs$estimate[coefs$term=="bh0.2"])
+d <- as.numeric(coefs$estimate[coefs$term=="bh1.i"])
+e <- as.numeric(coefs$estimate[coefs$term=="bh1.1"])
+f <- as.numeric(coefs$estimate[coefs$term=="bh1.2"])
+g <- as.numeric(coefs$estimate[coefs$term=="bh.oth.i"])
+h <- as.numeric(coefs$estimate[coefs$term=="bh.oth.1"])
+i <- as.numeric(coefs$estimate[coefs$term=="bh.oth.2"])
+
+h0.br <- h0.br |> select(1:4) |> mutate(z0.fun = a + b*log(time/10) + c*(log((time/10))^2))
+h1.br <- h1.br |> select(1:4) |> mutate(z0.fun = d + e*((time/10)^-.5) + f*((time/10)^-0.5*log(time/10))) 
+h.oth <- h.oth |> select(1:4) |> mutate(z0.fun = g + h*log(time/10) + i*((time/10)^2)) 
+
+bh <- bind_rows(h0.br, h1.br, h.oth)
+fig.2 <- ggplot(bh, aes(x=time, y=z0)) + 
+  geom_point(color='grey75') + 
+  geom_line(aes(y=z0.fun), color='cadetblue4') +
+  facet_wrap(~group) +
+  theme_bw() +
+  labs(x= "Time (years)", y="Log(baseline hazard")
+fig.2
+#rm(a, b, c, d, e, f, g, h, i, j, k, l, f4, h0.br, h1.br, h.oth, bh, bh0, bh1 )
+```
+
+## Model validation
+
+```{r validation, include=FALSE}
+
+set <- phe |> select(train, year, miss_screen, er, age, size, grade, nodes, her2, max_fu_10, br_10) |>
+  bind_cols(read_csv("./Breast/Version3.1/Outputs/v3.1_validation.csv")) |>
+  bind_cols(read_csv("./Breast/Version4.0/Outputs/v4.0_validation.csv")) |>
+  filter(miss_screen==FALSE, max_fu_10>=5, year>2010) |> 
+  mutate(high = ifelse(size<30 & nodes<4 & her2!=1, 0, 1),
+         train = factor(train, labels=c("Validation", "Training")),
+         er = factor(er, labels=c("Negative", "Positive"))) |> 
+  select(train, er, high, br_10, fu10.br.rx.3.1, fu10.br.rx.4.0)
+
+val <- set |>
+  group_by(train, er) |>
+  summarise(across(2:4, ~ sum(.x))) |>
+  ungroup() |>
+  mutate(diff3.1 = round(100*fu10.br.rx.3.1/br_10 - 100, 1),
+         diff4.0 = round(100*fu10.br.rx.4.0/br_10 - 100, 1)) |>
+  select(train, er, br_10, 
+         fu10.br.rx.3.1, diff3.1,
+         fu10.br.rx.4.0, diff4.0) |>
+  mutate(auc3.1=NA, auc4.0 = NA)
+
+disc <- set |>
+  group_by(train, er) |>
+  group_map(~roc(.x$br_10, .x$fu10.br.rx.3.1))
+
+for (i in 1:length(disc)) {
+  val$auc3.1[i] <- round(as.numeric(disc[[i]][9]), 3)
+}
+
+disc <- set |>
+  group_by(train, er) |>
+  group_map(~roc(.x$br_10, .x$fu10.br.rx.4.0))
+
+for (i in 1:length(disc)) {
+  val$auc4.0[i] <- round(as.numeric(disc[[i]][9]), 3)
+}
+
+val <- arrange(val, train) |> mutate(fu10.br.rx.3.1 = round(fu10.br.rx.3.1, 1),
+                                     fu10.br.rx.4.0 = round(fu10.br.rx.4.0, 1))
+```
+
+
+The PREDICT breast v4.0 based on the coefficients for the applied to the derived baseline hazard functions was applied to the subset of cases diagnosed after 2010 with at least 5 years potential follow-up to obtain the expected breast morality at 10 years (n=`r `nrow(set)`).  This was then compared with the observed breast cancer mortality.  There was a small improvement in both calibration and discrimination for v4.0.
+
+*Table 2: Calibration and discrimination of PREDICT v3.1 compared to v4.0*
+
+```{r table2}
+kable(val, col.names=c("Data set", "ER status", "Observed deaths", "v3.1", "Diff (%)", "v4.0", "Diff %", "v3.1", "v4.0")) |>
+  kable_styling(latex_options = "striped", font_size=10, full_width=FALSE, position="left") |>
+  add_header_above(c(" " = 3, "Predicted deaths v3.1" = 2, "Predicted deaths v4.0" =2,  "Discrimination (AUC)" = 2))
+```
+
+Goodness-of-fit was evaluated by comparing observed and predicted breast deaths in tenths of predicted risk.  Figure 3 shows that there was good calibration of predicted deaths across all levels of risk.
+
+*Figure 3:  Observed number event (95% CI) vs predicted deaths by tenths of predicted risk. A. ER negative. B. ER positive.*  
+```{r gof, include=FALSE, warnings=FALSE}
+gof <- set |>
+  select(er, br_10, fu10.br.rx.4.0) |>
+  group_by(er) |>
+  mutate(risk.gp = ntile(fu10.br.rx.4.0, 10)) |>
+  ungroup() |>
+  group_by(er, risk.gp) |>
+  summarise(number=n(), 
+            br_obs = sum(br_10), 
+            br_exp = sum(fu10.br.rx.4.0),
+            lcl_events = qchisq(0.025, df=2*br_obs)/2, 
+            ucl_events = qchisq(0.975, df=(2*(br_obs+1)))/2)
+
+g1 <- ggplot(data=filter(gof, er=="Negative"), aes( x=br_exp, y=br_obs)) +
+  geom_point(colour = 'red', size = 2) + 
+  geom_errorbar(aes(ymin=lcl_events, ymax=ucl_events), colour="red") +
+  geom_abline(slope=1) +
+  #xlim(0,400)+
+  #ylim(0,400)+
+  labs(x = "Predicted breast deaths", y = "Observed events") +
+  theme_bw() +
+  # font size
+  theme(plot.title=element_text(size = 10),
+        axis.text.x=element_text(size = 10),
+        axis.text.y=element_text(size = 10),
+        axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        #axis.title.y = element_blank()
+        )
+
+g2 <- ggplot(data=filter(gof, er=="Positive"), aes( x=br_exp, y=br_obs)) +
+  geom_point(colour = 'red', size = 2) + 
+  geom_errorbar(aes(ymin=lcl_events, ymax=ucl_events), colour="red") +
+  geom_abline(slope=1) +
+  #xlim(0,400)+
+  #ylim(0,400)+
+  labs(x = "Predicted breast deaths", y = "Observed breast deaths") +
+  theme_bw() +
+  # font size
+  theme(plot.title=element_text(size = 10),
+        axis.text.x=element_text(size = 10),
+        axis.text.y=element_text(size = 10),
+        axis.title.x = element_text(size=12),
+        #axis.title.y = element_text(size=12),
+        axis.title.y = element_blank())
+```
+```{r, fig.width=8, fig.height=3}
+g1 + g2 + plot_annotation(tag_levels="A")
+```
+
+
+
+
+
+
